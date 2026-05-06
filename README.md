@@ -1,20 +1,19 @@
-\## CUDA PCIe Exploration
+![C++](https://img.shields.io/badge/C++-17-blue.svg)
+![CUDA](https://img.shields.io/badge/CUDA-12.x-green.svg)
+![Status](https://img.shields.io/badge/Status-Phase_1-yellow.svg)
 
-Learning low-level CUDA memory management by characterizing host-to-device transfer latency.
+**CUDA PCIe Exploration**
+*Learning low-level CUDA memory management by characterizing host-to-device transfer latency.*
 
+---
 
-
-\### Current Status
-
+**Current Status**
 Phase 1: Baseline measurement of `cudaHostAllocWriteCombined` vs standard pinned memory on single transfers. 
-
 Next: Expand to streaming buffers and measure sustained bandwidth.
 
+---
 
-
-\### Tech Stack
-
-\- C++17, CUDA 12.x
-
-\- Target: NVIDIA T4 / A100 (cloud)
-
+**Tech Stack**
+*   **Language:** C-style C++17
+*   **Compiler:** NVCC (CUDA 12.x)
+*   **Target Hardware:** Discrete NVIDIA GPUs (Cloud T4 / AWS A100)
