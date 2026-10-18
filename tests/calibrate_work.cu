@@ -8,7 +8,8 @@
 __global__ void cal_kernel(const Chunk* chunks, int n_chunks, int work_iters, float* sink,
                            unsigned int* bad_total) {
     unsigned int bad = 0;
-    for (int k = 0; k < n_chunks; ++k) bad += process_chunk_warp(&chunks[k], work_iters, sink);
+    for (int k = 0; k < n_chunks; ++k)
+        bad += process_chunk_warp(&chunks[k], (unsigned long long)k, CAL_SAMPLES, work_iters, sink);
     if (threadIdx.x == 0) *bad_total = bad;
 }
 

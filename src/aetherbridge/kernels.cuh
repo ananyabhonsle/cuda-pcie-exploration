@@ -23,12 +23,14 @@ __host__ __device__ inline int work_iters_for(WorkLevel w) {
 typedef cuda::atomic_ref<unsigned long long, cuda::thread_scope_system> SysAtomicU64;
 
 // Called by all 32 lanes of one warp. Lane l handles samples l, l+32, ...
-// Verifies each sample against sample_value, then burns work_iters dependent
-// fmaf steps per sample. Returns the chunk's total mismatch count on every lane.
-__device__ inline unsigned int process_chunk_warp(const Chunk* c, int work_iters, float* sink) {
+// Verifies samples [0, n) against sample_value(seq, i), then burns work_iters
+// dependent fmaf steps per sample. seq and n are what the caller expects, not
+// the chunk's own header, so a corrupt header cannot steer the reads; n is
+// clamped to AB_MAX_CHUNK_SAMPLES. Returns the mismatch count on every lane.
+__device__ inline unsigned int process_chunk_warp(const Chunk* c, unsigned long long seq, unsigned int n,
+                                                  int work_iters, float* sink) {
     const unsigned int lane = threadIdx.x & 31u;
-    const unsigned long long seq = c->seq;
-    const unsigned int n = c->num_samples;
+    if (n > AB_MAX_CHUNK_SAMPLES) n = AB_MAX_CHUNK_SAMPLES;
     unsigned int bad = 0;
     float acc = 0.5f;
     for (unsigned int i = lane; i < n; i += 32) {

@@ -28,6 +28,7 @@ static void test_basic_paced() {
     CHECK(r.mismatches == 0);
     CHECK(r.stalled == 0);
     CHECK(r.samples == 2000);
+    CHECK(r.consumed == c.warmup + c.chunks);
     CHECK(r.episodes >= 1);
     CHECK(r.lat.p50 > 0.0);
     CHECK(r.lat.p50 <= r.lat.p99);
@@ -64,6 +65,7 @@ static void test_many_episodes_and_ack_wrap() {
     RunResult r = timed_run("many_episodes_and_ack_wrap", c, &ms);
     CHECK(r.episodes > 1);
     CHECK(r.samples == 10000);
+    CHECK(r.consumed == c.warmup + c.chunks);
     CHECK(r.mismatches == 0);
     CHECK(r.stalled == 0);
 }
@@ -78,6 +80,47 @@ static void test_corruption_is_detected() {
     CHECK(r.stalled == 0);
 }
 
+// A slot whose header seq does not match its ring index is one mismatch; the
+// samples are still checked against the ring index, so they all match.
+static void test_bad_header_seq_is_detected() {
+    RunConfig c = default_config();
+    c.chunks = 1000;
+    c.pace_us = 200;
+    c.debug_bad_seq_at = 700;
+    double ms;
+    RunResult r = timed_run("bad_header_seq_is_detected", c, &ms);
+    CHECK(r.mismatches == 1);
+    CHECK(r.stalled == 0);
+    CHECK(r.samples == c.chunks);
+    CHECK(r.consumed == c.warmup + c.chunks);
+}
+
+// An all-zero slot (seq 0, num_samples 0, samples 0) must not pass as valid.
+static void test_zeroed_slot_is_detected() {
+    RunConfig c = default_config();
+    c.chunks = 1000;
+    c.pace_us = 200;
+    c.debug_zero_slot_at = 700;
+    double ms;
+    RunResult r = timed_run("zeroed_slot_is_detected", c, &ms);
+    CHECK(r.mismatches >= 1);
+    CHECK(r.stalled == 0);
+    CHECK(r.samples == c.chunks);
+}
+
+// A huge num_samples is one mismatch and is never used as the loop bound.
+static void test_bad_header_count_is_detected() {
+    RunConfig c = default_config();
+    c.chunks = 1000;
+    c.pace_us = 200;
+    c.debug_bad_count_at = 700;
+    double ms;
+    RunResult r = timed_run("bad_header_count_is_detected", c, &ms);
+    CHECK(r.mismatches == 1);
+    CHECK(r.stalled == 0);
+    CHECK(r.samples == c.chunks);
+}
+
 static void test_stall_is_reported() {
     RunConfig c = default_config();
     c.chunks = 1000;
@@ -85,6 +128,7 @@ static void test_stall_is_reported() {
     double ms;
     RunResult r = timed_run("stall_is_reported", c, &ms);
     CHECK(r.stalled == 1);
+    CHECK(r.consumed == 300);
     CHECK(ms < 2000.0);
 }
 
@@ -95,6 +139,7 @@ static void test_no_producer_is_reported() {
     double ms;
     RunResult r = timed_run("no_producer_is_reported", c, &ms);
     CHECK(r.stalled == 1);
+    CHECK(r.consumed == 300);
     CHECK(ms < 2000.0);
 }
 
@@ -126,6 +171,9 @@ int main() {
     test_chunk_sizes();
     test_many_episodes_and_ack_wrap();
     test_corruption_is_detected();
+    test_bad_header_seq_is_detected();
+    test_zeroed_slot_is_detected();
+    test_bad_header_count_is_detected();
     test_stall_is_reported();
     test_no_producer_is_reported();
     test_no_kernel_is_reported();

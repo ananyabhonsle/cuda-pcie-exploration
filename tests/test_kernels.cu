@@ -2,8 +2,9 @@
 #include "check.h"
 
 // One warp processes one chunk; every lane writes its returned count.
-__global__ void process_kernel(const Chunk* c, int work_iters, float* sink, unsigned int* out32) {
-    unsigned int r = process_chunk_warp(c, work_iters, sink);
+__global__ void process_kernel(const Chunk* c, unsigned long long seq, unsigned int n, int work_iters,
+                               float* sink, unsigned int* out32) {
+    unsigned int r = process_chunk_warp(c, seq, n, work_iters, sink);
     out32[threadIdx.x] = r;
 }
 
@@ -16,16 +17,19 @@ __global__ void ack_kernel(unsigned long long* slots) {
 
 static Chunk h_chunk;
 
-// Runs the kernel on a copy of h_chunk; returns lane 0's count, sets *agree.
-static unsigned int run_process(int work_iters, bool* agree) {
+// Runs the kernel on a copy of h_chunk, checked against (seq, n); returns lane
+// 0's count, sets *agree. The copy is followed by a second chunk of NaNs, so
+// any read past the first chunk's samples counts as a mismatch.
+static unsigned int run_process_as(unsigned long long seq, unsigned int n, int work_iters, bool* agree) {
     Chunk* d_chunk;
     float* d_sink;
     unsigned int* d_out;
-    CUDA_CHECK(cudaMalloc(&d_chunk, sizeof(Chunk)));
+    CUDA_CHECK(cudaMalloc(&d_chunk, 2 * sizeof(Chunk)));
     CUDA_CHECK(cudaMalloc(&d_sink, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_out, 32 * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(d_chunk, 0xFF, 2 * sizeof(Chunk)));
     CUDA_CHECK(cudaMemcpy(d_chunk, &h_chunk, sizeof(Chunk), cudaMemcpyHostToDevice));
-    process_kernel<<<1, 32>>>(d_chunk, work_iters, d_sink, d_out);
+    process_kernel<<<1, 32>>>(d_chunk, seq, n, work_iters, d_sink, d_out);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     unsigned int out[32];
@@ -36,6 +40,10 @@ static unsigned int run_process(int work_iters, bool* agree) {
     CUDA_CHECK(cudaFree(d_sink));
     CUDA_CHECK(cudaFree(d_out));
     return out[0];
+}
+
+static unsigned int run_process(int work_iters, bool* agree) {
+    return run_process_as(h_chunk.seq, h_chunk.num_samples, work_iters, agree);
 }
 
 static void test_valid_chunks_have_no_mismatches() {
@@ -69,6 +77,23 @@ static void test_all_lanes_agree() {
     CHECK(r == 183u);
 }
 
+// Samples are checked against the seq the caller expects, not the slot's own.
+static void test_samples_checked_against_given_seq() {
+    fill_chunk(&h_chunk, 3, 320);
+    bool agree;
+    CHECK(run_process_as(4, 320, 0, &agree) > 300u);
+    CHECK(agree);
+}
+
+// A sample count above AB_MAX_CHUNK_SAMPLES is clamped: nothing past the
+// chunk is read.
+static void test_sample_count_is_clamped() {
+    fill_chunk(&h_chunk, 5, AB_MAX_CHUNK_SAMPLES);
+    bool agree;
+    CHECK(run_process_as(5, 2000, 0, &agree) == 0u);
+    CHECK(agree);
+}
+
 static void test_work_iters_for() {
     CHECK(work_iters_for(WORK_NONE) == 0);
     CHECK(work_iters_for(WORK_LIGHT) == AB_WORK_ITERS_LIGHT);
@@ -95,6 +120,8 @@ int main() {
     test_valid_chunks_have_no_mismatches();
     test_corrupted_samples_are_counted();
     test_all_lanes_agree();
+    test_samples_checked_against_given_seq();
+    test_sample_count_is_clamped();
     test_work_iters_for();
     test_ack_slot_written();
     return check_finish();

@@ -23,6 +23,8 @@ static void test_parse_defaults() {
     CHECK(c.debug_corrupt_seq == -1); CHECK(c.debug_kernel_stop_at == -1);
     CHECK(c.debug_producer_stop_at == -1); CHECK(c.debug_skip_kernel == 0);
     CHECK(c.debug_kernel_max_age_ms == 0);
+    CHECK(c.debug_bad_seq_at == -1); CHECK(c.debug_bad_count_at == -1);
+    CHECK(c.debug_zero_slot_at == -1);
 }
 
 static void test_parse_all_flags() {

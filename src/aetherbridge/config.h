@@ -17,12 +17,17 @@ struct RunConfig {
     unsigned long long warmup;
     int episode_ms;
     char csv_path[512];
-    // Test hooks: -1 / 0 = off. Never set by parse_args.
+    // Test hooks: -1 / 0 = off. Never set by parse_args. The *_at hooks act on
+    // the chunk with that seq: a wrong header seq, a num_samples of 0xFFFFFFFF,
+    // or an all-zero slot.
     long long debug_corrupt_seq;
     long long debug_kernel_stop_at;
     long long debug_producer_stop_at;
     int debug_skip_kernel;
     int debug_kernel_max_age_ms;  // 0 = ZC_MAX_KERNEL_AGE_MS
+    long long debug_bad_seq_at;
+    long long debug_bad_count_at;
+    long long debug_zero_slot_at;
 };
 
 inline RunConfig default_config() {
@@ -43,6 +48,9 @@ inline RunConfig default_config() {
     c.debug_producer_stop_at = -1;
     c.debug_skip_kernel = 0;
     c.debug_kernel_max_age_ms = 0;
+    c.debug_bad_seq_at = -1;
+    c.debug_bad_count_at = -1;
+    c.debug_zero_slot_at = -1;
     return c;
 }
 
@@ -149,6 +157,7 @@ struct RunResult {
     double mb_per_s;
     unsigned long long mismatches;
     unsigned long long samples;
+    unsigned long long consumed;  // chunks the GPU consumed, warmup included (not in the CSV)
     unsigned long long episodes;
     int stalled;
 };

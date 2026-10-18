@@ -22,6 +22,9 @@ struct ZcRing {
 };
 
 // Written by lane 0 when the kernel exits; lives in device memory.
+// mismatches counts wrong samples plus one per chunk whose header is wrong
+// (seq != its ring index, or num_samples != the run's chunk size); a header
+// error is an integrity error like a bad sample, so it shares the CSV column.
 struct ZcKernelResult {
     unsigned long long consumed;
     unsigned long long mismatches;
@@ -52,11 +55,12 @@ __device__ inline unsigned long long zc_globaltimer_ns() {
 // Launch <<<1, 32>>>. Only lane 0 touches head/tail/stop_at/running_episode;
 // __syncwarp orders the other lanes' slot reads after lane 0's acquire and
 // before its release; __shfl_sync broadcasts every decision so all lanes branch
-// identically. Test hook: debug_stop_at >= 0 stops consumption at that seq
-// (the kernel keeps looping, so the watchdogs fire). max_age_ms is
-// ZC_MAX_KERNEL_AGE_MS except in tests.
-__global__ void zc_consumer_kernel(ZcRing* ring, unsigned long long* ack_slots, int work_iters,
-                                   unsigned long long episode_id, long long debug_stop_at,
+// identically. num_samples is the run's chunk size (<= AB_MAX_CHUNK_SAMPLES).
+// Test hook: debug_stop_at >= 0 stops consumption at that seq (the kernel
+// keeps looping, so the watchdogs fire). max_age_ms is ZC_MAX_KERNEL_AGE_MS
+// except in tests.
+__global__ void zc_consumer_kernel(ZcRing* ring, unsigned long long* ack_slots, unsigned int num_samples,
+                                   int work_iters, unsigned long long episode_id, long long debug_stop_at,
                                    int max_age_ms, ZcKernelResult* out, float* sink) {
     const unsigned int full = 0xFFFFFFFFu;
     const unsigned int lane = threadIdx.x & 31u;
@@ -121,13 +125,21 @@ __global__ void zc_consumer_kernel(ZcRing* ring, unsigned long long* ack_slots, 
 
         const unsigned long long idx = __shfl_sync(full, t, 0);
         const Chunk* c = &ring->slots[idx % AB_QUEUE_CAPACITY];
-        const unsigned long long seq = c->seq;
+        // Integrity: the header must name this ring index and the run's chunk
+        // size. It is read here but judged after processing, so its PCIe read
+        // overlaps the sample reads; the samples are checked against idx and
+        // num_samples, never against the header.
+        const unsigned long long hdr_seq = c->seq;
+        const unsigned int hdr_n = c->num_samples;
         // Ends with a full-mask shuffle, so every lane's slot reads are done.
-        const unsigned int bad = process_chunk_warp(c, work_iters, sink);
+        const unsigned int bad = process_chunk_warp(c, idx, num_samples, work_iters, sink);
         __syncwarp(full);
         if (lane == 0) {
             mismatches += bad;
-            write_ack(ack_slots, seq);
+            if (hdr_seq != idx || hdr_n != num_samples) ++mismatches;
+            // Ack the ring index: acks stay in order and exactly once even
+            // when the header is corrupt (the corruption is counted above).
+            write_ack(ack_slots, idx);
             t = idx + 1;
             // memory_order_release: the slot reads above finish before the
             // producer may reuse the slot.
@@ -213,6 +225,7 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
 
     unsigned long long head = 0;  // producer's copy; it is the only writer
     unsigned long long episodes = 0, mismatches = 0;  // episodes = kernels launched
+    unsigned long long consumed = 0;                   // summed over episodes
     unsigned long long episode_id = 0;                 // running_episode starts at 0
     double active_us = 0.0;
     int stalled = 0;
@@ -223,7 +236,7 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
         stop_a.store(AB_ACK_EMPTY, cuda::memory_order_release);  // no stop yet
         CUDA_CHECK(cudaMemset(d_res, 0, sizeof(ZcKernelResult)));
         if (!cfg.debug_skip_kernel) {
-            zc_consumer_kernel<<<1, 32>>>(d_ring, d_acks, work_iters, episode_id,
+            zc_consumer_kernel<<<1, 32>>>(d_ring, d_acks, num_samples, work_iters, episode_id,
                                           cfg.debug_kernel_stop_at, max_age_ms, d_res, d_sink);
             CUDA_CHECK(cudaGetLastError());
             // Windows (WDDM) queues launches until something flushes them.
@@ -267,6 +280,12 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
             fill_chunk(c, head, num_samples);
             if (cfg.debug_corrupt_seq >= 0 && head == (unsigned long long)cfg.debug_corrupt_seq)
                 c->samples[0] += 1.0f;
+            if (cfg.debug_bad_seq_at >= 0 && head == (unsigned long long)cfg.debug_bad_seq_at)
+                c->seq = head + 1;
+            if (cfg.debug_bad_count_at >= 0 && head == (unsigned long long)cfg.debug_bad_count_at)
+                c->num_samples = 0xFFFFFFFFu;
+            if (cfg.debug_zero_slot_at >= 0 && head == (unsigned long long)cfg.debug_zero_slot_at)
+                memset(c, 0, sizeof(Chunk));
             // memory_order_release: the chunk is visible to the GPU before head moves.
             head_a.store(head + 1, cuda::memory_order_release);
             ++head;
@@ -282,6 +301,7 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
         ZcKernelResult kr;
         CUDA_CHECK(cudaMemcpy(&kr, d_res, sizeof(kr), cudaMemcpyDeviceToHost));
         mismatches += kr.mismatches;
+        consumed += kr.consumed;
         if (kr.stalled || producer_stopped) stalled = 1;
         if (stalled) log.abort.store(1, std::memory_order_release);
     }
@@ -294,6 +314,11 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
     for (unsigned long long s = cfg.warmup; s < total; ++s)
         if (log.acked[s]) ++samples;
     if (observer_stalled || samples != cfg.chunks) stalled = 1;
+    // Exactly once: the kernels must have consumed every published chunk, no
+    // more and no fewer. A difference means the consumer did not finish the
+    // work it was given, so it is reported as stalled (mismatches keeps
+    // counting only bad chunks the kernel actually saw).
+    if (consumed != head) stalled = 1;
 
     if (samples == cfg.chunks) {
         double* lat = (double*)malloc((size_t)cfg.chunks * sizeof(double));
@@ -308,6 +333,7 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
 
     r.samples = samples;
     r.mismatches = mismatches;
+    r.consumed = consumed;
     r.episodes = episodes;
     r.stalled = stalled;
     // head == total on a complete run; on an aborted run it counts what was sent.
