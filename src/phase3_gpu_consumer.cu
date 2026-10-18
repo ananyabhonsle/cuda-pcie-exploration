@@ -2,6 +2,7 @@
 #include <cuda/atomic>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <thread>
 #include <chrono>
 
@@ -82,7 +83,9 @@ void producer(RingBuffer* buf, bool* ok) {
 }
 
 // WORKER B: The Consumer (one GPU thread, reading host memory over PCIe)
-__global__ void consumer(RingBuffer* buf, Result* out) {
+// batch_log[i] records how many items batch i consumed. It lives in GPU memory,
+// so logging costs one fast local store per batch, not a PCIe write.
+__global__ void consumer(RingBuffer* buf, Result* out, unsigned int* batch_log) {
     SysAtomic head(buf->head);
     SysAtomic tail(buf->tail);
 
@@ -105,14 +108,17 @@ __global__ void consumer(RingBuffer* buf, Result* out) {
         }
 
         // Consume the whole batch, then publish the new tail once
+        unsigned int batch_items = 0;
         while (current_tail != current_head) {
             sum += buf->data[current_tail];
             current_tail = (current_tail + 1) % BUFFER_SIZE;
-            consumed++;
+            batch_items++;
         }
+        consumed += batch_items;
 
         // memory_order_release: Ensures the data reads ABOVE finish BEFORE the producer can reuse these slots
         tail.store(current_tail, cuda::std::memory_order_release);
+        batch_log[batches] = batch_items;
         batches++;
         last_progress = globaltimer_ns();
     }
@@ -120,6 +126,61 @@ __global__ void consumer(RingBuffer* buf, Result* out) {
     out->sum = sum;
     out->consumed = consumed;
     out->batches = batches;
+}
+
+static int compare_uint(const void* a, const void* b) {
+    unsigned int x = *(const unsigned int*)a, y = *(const unsigned int*)b;
+    return (x > y) - (x < y);
+}
+
+// 3b: how big were the batches? Prints a histogram plus a sample of consecutive
+// batches, to show whether big and small batches alternate.
+static void print_batch_report(const unsigned int* sizes, unsigned long long n) {
+    if (n == 0) return;
+
+    // Power-of-two buckets: 1, 2-3, 4-7, ... 512-1023 (a batch is at most BUFFER_SIZE - 1)
+    const int NUM_BUCKETS = 10;
+    unsigned long long bucket_batches[NUM_BUCKETS] = {0};
+    unsigned long long bucket_items[NUM_BUCKETS] = {0};
+    unsigned long long big_small_pairs = 0;
+    for (unsigned long long i = 0; i < n; i++) {
+        int b = 0;
+        while ((2u << b) <= sizes[i] && b < NUM_BUCKETS - 1) b++;
+        bucket_batches[b]++;
+        bucket_items[b] += sizes[i];
+        if (i > 0) {
+            unsigned int lo = sizes[i] < sizes[i - 1] ? sizes[i] : sizes[i - 1];
+            unsigned int hi = sizes[i] < sizes[i - 1] ? sizes[i - 1] : sizes[i];
+            if (hi >= 4 * lo) big_small_pairs++;
+        }
+    }
+
+    unsigned int* sorted = (unsigned int*)malloc(n * sizeof(unsigned int));
+    if (sorted == NULL) return;
+    memcpy(sorted, sizes, n * sizeof(unsigned int));
+    qsort(sorted, n, sizeof(unsigned int), compare_uint);
+    printf("\nBatch sizes over %llu batches: min %u, median %u, max %u\n",
+           n, sorted[0], sorted[n / 2], sorted[n - 1]);
+    free(sorted);
+
+    printf("  %-10s %10s %13s %11s\n", "size", "batches", "% of batches", "% of items");
+    for (int b = 0; b < NUM_BUCKETS; b++) {
+        char label[16];
+        unsigned int lo = 1u << b, hi = (2u << b) - 1;
+        if (lo == hi) snprintf(label, sizeof(label), "%u", lo);
+        else snprintf(label, sizeof(label), "%u-%u", lo, hi);
+        printf("  %-10s %10llu %12.1f%% %10.1f%%\n", label, bucket_batches[b],
+               100.0 * bucket_batches[b] / n, 100.0 * bucket_items[b] / ITERATIONS);
+    }
+    if (n > 1) {
+        printf("Consecutive batches where one is 4x+ the other: %.1f%%\n", 100.0 * big_small_pairs / (n - 1));
+    }
+
+    unsigned long long start = n / 2 > 8 ? n / 2 - 8 : 0;
+    unsigned long long end = start + 16 < n ? start + 16 : n;
+    printf("Sample from the middle of the run (batches %llu-%llu):", start, end - 1);
+    for (unsigned long long i = start; i < end; i++) printf(" %u", sizes[i]);
+    printf("\n\n");
 }
 
 int main() {
@@ -136,13 +197,17 @@ int main() {
     Result* d_result = NULL;
     CUDA_CHECK(cudaMalloc(&d_result, sizeof(Result)));
     CUDA_CHECK(cudaMemset(d_result, 0, sizeof(Result)));
+
+    // Worst case is one item per batch, so room for ITERATIONS entries (4 MB)
+    unsigned int* d_batch_log = NULL;
+    CUDA_CHECK(cudaMalloc(&d_batch_log, ITERATIONS * sizeof(unsigned int)));
     printf("[SUCCESS] Ring buffer allocated in mapped pinned memory.\n");
 
     // Start timing
     auto start_time = std::chrono::steady_clock::now();
 
     // Launch the GPU consumer first, so it is waiting when data arrives
-    consumer<<<1, 1>>>(d_buf, d_result);
+    consumer<<<1, 1>>>(d_buf, d_result, d_batch_log);
     CUDA_CHECK(cudaGetLastError());
 
     // On Windows (WDDM) launches are queued until something flushes them. Without this
@@ -166,6 +231,13 @@ int main() {
 
     Result result;
     CUDA_CHECK(cudaMemcpy(&result, d_result, sizeof(Result), cudaMemcpyDeviceToHost));
+    unsigned int* batch_log = (unsigned int*)malloc(ITERATIONS * sizeof(unsigned int));
+    if (batch_log == NULL) {
+        printf("[FATAL] Failed to allocate batch log.\n");
+        return EXIT_FAILURE;
+    }
+    CUDA_CHECK(cudaMemcpy(batch_log, d_batch_log, result.batches * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_batch_log));
     CUDA_CHECK(cudaFree(d_result));
     CUDA_CHECK(cudaFreeHost(buf));
 
@@ -193,6 +265,8 @@ int main() {
     printf("[SUCCESS] Processed in %.2f ms (%llu batches, avg %.1f items/batch, %.2f us/batch)\n",
            duration.count(), result.batches, (double)result.consumed / result.batches,
            duration.count() * 1e3 / result.batches);
+    print_batch_report(batch_log, result.batches);
+    free(batch_log);
     printf("--- PHASE 3 COMPLETE ---\n");
     return 0;
 }
