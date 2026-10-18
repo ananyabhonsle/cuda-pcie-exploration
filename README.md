@@ -42,7 +42,7 @@ Laptop figures are typical of 3-5 runs; T4 figures are from one run. The T4 VM i
 
 Unpaced throughput: ~114,000 chunks/s (146 MB/s). In the unpaced row the producer keeps the queue full, so its latency is mostly time spent waiting in the queue, not hand-off cost.
 
-Paced `work none` p50 of ~10 us is about 5-7 dependent PCIe round trips per chunk. About 5% of chunks show 0.1-1.2 ms spikes, which drive p99; the likely cause is WDDM scheduling or thread descheduling, but this was not confirmed. These are single runs from one laptop; the T4 run is still to do.
+Paced `work none` p50 is ~10 us. As an estimate, not a measurement: Phase 3 measured ~1 us per GPU read of host memory, and each paced chunk needs several dependent PCIe accesses (poll head, read chunk header, read samples, ack write, observer notices the ack), which is consistent with ~10 us. The tail is much longer than the median: in the paced runs p99 is 147-328 us, p99.9 is 0.7-1.1 ms and max is 1.6-2.6 ms. The likely cause is Windows/WDDM scheduling or thread descheduling, but this was not confirmed. These are single runs from one laptop; the T4 run is still to do.
 
 ---
 
