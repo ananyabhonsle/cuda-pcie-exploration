@@ -82,10 +82,15 @@ void producer(RingBuffer* buf, bool* ok) {
     *ok = true;
 }
 
-// WORKER B: The Consumer (one GPU thread, reading host memory over PCIe)
+// WORKER B: The Consumer (GPU, reading host memory over PCIe)
+// Launched with 1 thread (3a) or one warp of 32 threads (3c, --warp).
+// Lane 0 is the only thread that touches head/tail; all lanes share the data reads.
 // batch_log[i] records how many items batch i consumed. It lives in GPU memory,
 // so logging costs one fast local store per batch, not a PCIe write.
 __global__ void consumer(RingBuffer* buf, Result* out, unsigned int* batch_log) {
+    const unsigned int lane = threadIdx.x;
+    const unsigned int lanes = blockDim.x;
+    const unsigned int mask = (lanes == 32) ? 0xffffffffu : 1u;
     SysAtomic head(buf->head);
     SysAtomic tail(buf->tail);
 
@@ -96,36 +101,53 @@ __global__ void consumer(RingBuffer* buf, Result* out, unsigned int* batch_log) 
     while (consumed < ITERATIONS) {
         // One PCIe round trip (~1 us) tells us how many items are ready.
         // memory_order_acquire: Ensures the data reads BELOW see what the producer wrote
-        size_t current_head = head.load(cuda::std::memory_order_acquire);
+        size_t current_head = 0;
+        if (lane == 0) {
+            current_head = head.load(cuda::std::memory_order_acquire);
+        }
+        // __syncwarp orders the other lanes' data reads after lane 0's acquire
+        __syncwarp(mask);
+        current_head = __shfl_sync(mask, current_head, 0);
 
         // If head equals tail, the buffer is empty. Wait.
         if (current_head == current_tail) {
-            if (globaltimer_ns() - last_progress > STALL_TIMEOUT_MS * 1000000ULL) {
-                out->timed_out = 1;
+            int stalled = (lane == 0) && (globaltimer_ns() - last_progress > STALL_TIMEOUT_MS * 1000000ULL);
+            if (__shfl_sync(mask, stalled, 0)) {
+                if (lane == 0) out->timed_out = 1;
                 break;
             }
             continue;
         }
 
-        // Consume the whole batch, then publish the new tail once
-        unsigned int batch_items = 0;
-        while (current_tail != current_head) {
-            sum += buf->data[current_tail];
-            current_tail = (current_tail + 1) % BUFFER_SIZE;
-            batch_items++;
+        // Consume the whole batch. Lane i reads slots i, i+32, i+64, ... so one warp
+        // fetches 32 consecutive ints (128 bytes) per PCIe request instead of 4 bytes.
+        unsigned int batch_items = (unsigned int)((current_head + BUFFER_SIZE - current_tail) % BUFFER_SIZE);
+        for (unsigned int i = lane; i < batch_items; i += lanes) {
+            sum += buf->data[(current_tail + i) % BUFFER_SIZE];
         }
+        current_tail = (current_tail + batch_items) % BUFFER_SIZE;
         consumed += batch_items;
 
-        // memory_order_release: Ensures the data reads ABOVE finish BEFORE the producer can reuse these slots
-        tail.store(current_tail, cuda::std::memory_order_release);
-        batch_log[batches] = batch_items;
+        // Every lane's reads must finish before lane 0 frees the slots
+        __syncwarp(mask);
+        if (lane == 0) {
+            // memory_order_release: Ensures the data reads ABOVE finish BEFORE the producer can reuse these slots
+            tail.store(current_tail, cuda::std::memory_order_release);
+            batch_log[batches] = batch_items;
+            last_progress = globaltimer_ns();
+        }
         batches++;
-        last_progress = globaltimer_ns();
     }
 
-    out->sum = sum;
-    out->consumed = consumed;
-    out->batches = batches;
+    // Combine the per-lane partial sums
+    for (unsigned int offset = lanes / 2; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(mask, sum, offset);
+    }
+    if (lane == 0) {
+        out->sum = sum;
+        out->consumed = consumed;
+        out->batches = batches;
+    }
 }
 
 static int compare_uint(const void* a, const void* b) {
@@ -183,8 +205,19 @@ static void print_batch_report(const unsigned int* sizes, unsigned long long n) 
     printf("\n\n");
 }
 
-int main() {
-    printf("--- PHASE 3: GPU CONSUMER TEST ---\n");
+int main(int argc, char** argv) {
+    // 3a: one consumer thread (default). 3c: --warp, one warp of 32 consumer threads.
+    int lanes = 1;
+    for (int a = 1; a < argc; a++) {
+        if (strcmp(argv[a], "--warp") == 0) {
+            lanes = 32;
+        } else {
+            printf("Usage: %s [--warp]\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+    printf("--- PHASE 3: GPU CONSUMER TEST (%s) ---\n",
+           lanes == 32 ? "3c: 32-thread warp consumer" : "3a: 1-thread consumer");
 
     // Mapped pinned memory: lives in host RAM, but the GPU can read/write it directly.
     RingBuffer* buf = NULL;
@@ -207,7 +240,7 @@ int main() {
     auto start_time = std::chrono::steady_clock::now();
 
     // Launch the GPU consumer first, so it is waiting when data arrives
-    consumer<<<1, 1>>>(d_buf, d_result, d_batch_log);
+    consumer<<<1, lanes>>>(d_buf, d_result, d_batch_log);
     CUDA_CHECK(cudaGetLastError());
 
     // On Windows (WDDM) launches are queued until something flushes them. Without this
