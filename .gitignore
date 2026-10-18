@@ -1,0 +1,19 @@
+# Build outputs
+phase1
+phase2
+*.exe
+*.o
+*.obj
+*.exp
+*.lib
+*.pdb
+build/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
