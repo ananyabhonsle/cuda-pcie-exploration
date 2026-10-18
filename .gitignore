@@ -18,3 +18,7 @@ build/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local worktrees and agent workspaces
+.worktrees/
+.superpowers/
