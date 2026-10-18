@@ -243,6 +243,7 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
     SysAtomicU64 running_a(ring->running_episode);
 
     unsigned long long head = 0;  // producer's copy; it is the only writer
+    Chunk local;                  // producer-local chunk, generated before t_send
     unsigned long long episodes = 0, mismatches = 0;  // episodes = kernels launched
     unsigned long long consumed = 0;                   // summed over episodes
     unsigned long long work_ns = 0, work_chunks = 0;   // summed over episodes
@@ -289,6 +290,17 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
             // default, below its AB_STALL_TIMEOUT_MS watchdog) for any pace_us.
             const double target = cfg.pace_us > 0 ? episode_start + (double)k * cfg.pace_us : now_us();
             if (k > 0 && target - episode_start >= episode_us) break;
+            // Generate the chunk (and apply test hooks) before the sample
+            // starts: see the sample definition next to record_send.
+            fill_chunk(&local, head, num_samples);
+            if (cfg.debug_corrupt_seq >= 0 && head == (unsigned long long)cfg.debug_corrupt_seq)
+                local.samples[0] += 1.0f;
+            if (cfg.debug_bad_seq_at >= 0 && head == (unsigned long long)cfg.debug_bad_seq_at)
+                local.seq = head + 1;
+            if (cfg.debug_bad_count_at >= 0 && head == (unsigned long long)cfg.debug_bad_count_at)
+                local.num_samples = 0xFFFFFFFFu;
+            if (cfg.debug_zero_slot_at >= 0 && head == (unsigned long long)cfg.debug_zero_slot_at)
+                memset(&local, 0, sizeof(Chunk));
             if (cfg.pace_us > 0) pace_until(target);
             if (!zc_wait_for_space(tail_a, head)) {
                 stalled = 1;
@@ -296,16 +308,9 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
             }
             record_send(&log, head);
             if (k == 0) first_send = log.t_send[head];
-            Chunk* c = &ring->slots[head % AB_QUEUE_CAPACITY];
-            fill_chunk(c, head, num_samples);
-            if (cfg.debug_corrupt_seq >= 0 && head == (unsigned long long)cfg.debug_corrupt_seq)
-                c->samples[0] += 1.0f;
-            if (cfg.debug_bad_seq_at >= 0 && head == (unsigned long long)cfg.debug_bad_seq_at)
-                c->seq = head + 1;
-            if (cfg.debug_bad_count_at >= 0 && head == (unsigned long long)cfg.debug_bad_count_at)
-                c->num_samples = 0xFFFFFFFFu;
-            if (cfg.debug_zero_slot_at >= 0 && head == (unsigned long long)cfg.debug_zero_slot_at)
-                memset(c, 0, sizeof(Chunk));
+            // Header plus num_samples floats; the count is the run's, never the
+            // local header's (a test hook may have corrupted it).
+            copy_chunk(&ring->slots[head % AB_QUEUE_CAPACITY], &local, num_samples);
             // memory_order_release: the chunk is visible to the GPU before head moves.
             head_a.store(head + 1, cuda::memory_order_release);
             ++head;

@@ -76,6 +76,32 @@ static void test_fill_chunk() {
     CHECK(ok);
 }
 
+// copy_chunk copies the header and the first n samples only; n is clamped.
+static void test_copy_chunk() {
+    static struct { Chunk c; float guard[16]; } dst;
+    static Chunk src;
+    fill_chunk(&src, 7, AB_MAX_CHUNK_SAMPLES);
+    src.num_samples = 320;
+    for (unsigned int i = 0; i < AB_MAX_CHUNK_SAMPLES; ++i) dst.c.samples[i] = -5.0f;
+    for (int i = 0; i < 16; ++i) dst.guard[i] = -7.0f;
+    dst.c.seq = 0; dst.c.num_samples = 0;
+    copy_chunk(&dst.c, &src, 320);
+    CHECK(dst.c.seq == 7);
+    CHECK(dst.c.num_samples == 320);
+    bool head_ok = true, rest_ok = true;
+    for (unsigned int i = 0; i < 320; ++i) if (dst.c.samples[i] != sample_value(7, i)) head_ok = false;
+    for (unsigned int i = 320; i < AB_MAX_CHUNK_SAMPLES; ++i) if (dst.c.samples[i] != -5.0f) rest_ok = false;
+    CHECK(head_ok);
+    CHECK(rest_ok);
+
+    copy_chunk(&dst.c, &src, 5000);
+    bool all_ok = true, guard_ok = true;
+    for (unsigned int i = 0; i < AB_MAX_CHUNK_SAMPLES; ++i) if (dst.c.samples[i] != sample_value(7, i)) all_ok = false;
+    for (int i = 0; i < 16; ++i) if (dst.guard[i] != -7.0f) guard_ok = false;
+    CHECK(all_ok);
+    CHECK(guard_ok);
+}
+
 int main() {
     test_stats_nearest_rank();
     test_stats_single_value();
@@ -83,5 +109,6 @@ int main() {
     test_sample_value_host_equals_device();
     test_sample_value_range();
     test_fill_chunk();
+    test_copy_chunk();
     return check_finish();
 }

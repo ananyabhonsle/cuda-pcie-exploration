@@ -19,7 +19,7 @@ struct RunConfig {
     char csv_path[512];
     // Test hooks: -1 / 0 = off. Never set by parse_args. The *_at hooks act on
     // the chunk with that seq: a wrong header seq, a num_samples of 0xFFFFFFFF,
-    // or an all-zero slot.
+    // or an all-zero header and samples.
     long long debug_corrupt_seq;
     long long debug_kernel_stop_at;
     long long debug_producer_stop_at;

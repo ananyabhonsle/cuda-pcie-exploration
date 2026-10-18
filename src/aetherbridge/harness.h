@@ -1,5 +1,5 @@
 #pragma once
-#include "common.h"
+#include "aetherbridge/common.h"
 #include <atomic>
 #include <cuda/atomic>
 
@@ -36,7 +36,19 @@ inline void latency_log_free(LatencyLog* log) {
     log->acked = NULL;
 }
 
-// Call immediately before publishing chunk `seq`.
+// What one latency sample covers, identically for every variant (V5 here;
+// the Phase 5/6 variants must follow the same definition):
+//   A sample starts when the producer begins copying the chunk into a queue
+//   slot that has space, and ends when the observer notices the chunk's ack.
+//   It covers that copy, the time in the queue, the GPU's processing, the
+//   ack's trip back over PCIe, and the observer noticing it.
+//   Excluded: generating the chunk's data (done beforehand into a
+//   producer-local chunk) and waiting for queue space (done before the
+//   timestamp).
+// So a producer does: generate into a local chunk -> wait for space (not
+// timed) -> record_send -> copy into the slot -> publish.
+//
+// Call immediately before copying chunk `seq` into its queue slot.
 inline void record_send(LatencyLog* log, unsigned long long seq) {
     log->t_send[seq] = now_us();
     log->sent.store(seq + 1, std::memory_order_release);

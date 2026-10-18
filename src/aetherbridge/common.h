@@ -54,6 +54,17 @@ inline void fill_chunk(Chunk* c, unsigned long long seq, unsigned int num_sample
     for (unsigned int i = 0; i < num_samples; ++i) c->samples[i] = sample_value(seq, i);
 }
 
+// Copies src's header and its first n samples (n clamped to
+// AB_MAX_CHUNK_SAMPLES) into dst, e.g. from a producer-local chunk into a
+// queue slot. n comes from the caller, never from src's header.
+inline void copy_chunk(Chunk* dst, const Chunk* src, unsigned int n) {
+    if (n > AB_MAX_CHUNK_SAMPLES) n = AB_MAX_CHUNK_SAMPLES;
+    dst->seq = src->seq;
+    dst->num_samples = src->num_samples;
+    dst->pad = src->pad;
+    memcpy(dst->samples, src->samples, (size_t)n * sizeof(float));
+}
+
 inline unsigned int samples_for_chunk_ms(int chunk_ms) {
     return (unsigned int)(chunk_ms * (AB_SAMPLE_RATE / 1000));
 }
