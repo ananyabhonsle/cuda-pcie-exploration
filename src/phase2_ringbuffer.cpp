@@ -1,4 +1,3 @@
-%%writefile phase2_ringbuffer.cpp
 #include <iostream>
 #include <atomic>
 #include <thread>
@@ -14,7 +13,7 @@
 struct RingBuffer {
     alignas(64) std::atomic<size_t> head;
     alignas(64) std::atomic<size_t> tail;
-    int data[BUFFER_SIZE];
+    alignas(64) int data[BUFFER_SIZE]; // Keep data off the tail's cache line
 };
 
 // WORKER A: The Producer
@@ -55,9 +54,9 @@ void consumer(RingBuffer* buf) {
         expected_sum += value;
 
         // 2. Update the tail pointer
-        // memory_order_acquire: Ensures we don't read data BEFORE this pointer update
+        // memory_order_release: Ensures the data read ABOVE finishes BEFORE the producer can reuse this slot
         size_t next_tail = (current_tail + 1) % BUFFER_SIZE;
-        buf->tail.store(next_tail, std::memory_order_acquire);
+        buf->tail.store(next_tail, std::memory_order_release);
     }
 
     // Mathematical proof of data integrity
