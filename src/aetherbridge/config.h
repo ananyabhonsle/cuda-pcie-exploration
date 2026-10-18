@@ -22,6 +22,7 @@ struct RunConfig {
     long long debug_kernel_stop_at;
     long long debug_producer_stop_at;
     int debug_skip_kernel;
+    int debug_kernel_max_age_ms;  // 0 = ZC_MAX_KERNEL_AGE_MS
 };
 
 inline RunConfig default_config() {
@@ -41,6 +42,7 @@ inline RunConfig default_config() {
     c.debug_kernel_stop_at = -1;
     c.debug_producer_stop_at = -1;
     c.debug_skip_kernel = 0;
+    c.debug_kernel_max_age_ms = 0;
     return c;
 }
 

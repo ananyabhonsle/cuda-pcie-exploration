@@ -22,6 +22,7 @@ static void test_parse_defaults() {
     CHECK(c.episode_ms == 800); CHECK(c.csv_path[0] == 0);
     CHECK(c.debug_corrupt_seq == -1); CHECK(c.debug_kernel_stop_at == -1);
     CHECK(c.debug_producer_stop_at == -1); CHECK(c.debug_skip_kernel == 0);
+    CHECK(c.debug_kernel_max_age_ms == 0);
 }
 
 static void test_parse_all_flags() {

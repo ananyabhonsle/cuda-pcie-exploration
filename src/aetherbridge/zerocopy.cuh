@@ -38,14 +38,26 @@ __device__ inline unsigned long long zc_globaltimer_ns() {
 #define ZC_ACT_PROCESS 1
 #define ZC_ACT_EXIT 2
 
+// An empty poll costs one PCIe round trip (the head load). stop_at and the
+// watchdogs are checked only on every ZC_STOP_CHECK_POLLS-th consecutive empty
+// poll, so a poll is not two dependent round trips; this delays the exit at an
+// episode end by at most that many polls.
+#define ZC_STOP_CHECK_POLLS 16
+
+// A kernel that has run this long exits with stalled = 1, so its lifetime stays
+// under the ~2 s Windows (WDDM) limit even if a stall starts late in an
+// episode (episode_ms + AB_STALL_TIMEOUT_MS alone could reach 1.8 s).
+#define ZC_MAX_KERNEL_AGE_MS 1500
+
 // Launch <<<1, 32>>>. Only lane 0 touches head/tail/stop_at/running_episode;
 // __syncwarp orders the other lanes' slot reads after lane 0's acquire and
 // before its release; __shfl_sync broadcasts every decision so all lanes branch
 // identically. Test hook: debug_stop_at >= 0 stops consumption at that seq
-// (the kernel keeps looping, so the watchdogs fire).
+// (the kernel keeps looping, so the watchdogs fire). max_age_ms is
+// ZC_MAX_KERNEL_AGE_MS except in tests.
 __global__ void zc_consumer_kernel(ZcRing* ring, unsigned long long* ack_slots, int work_iters,
                                    unsigned long long episode_id, long long debug_stop_at,
-                                   ZcKernelResult* out, float* sink) {
+                                   int max_age_ms, ZcKernelResult* out, float* sink) {
     const unsigned int full = 0xFFFFFFFFu;
     const unsigned int lane = threadIdx.x & 31u;
     SysAtomicU64 head(ring->head);
@@ -53,16 +65,21 @@ __global__ void zc_consumer_kernel(ZcRing* ring, unsigned long long* ack_slots, 
     SysAtomicU64 stop_at(ring->stop_at);
     SysAtomicU64 running(ring->running_episode);
     const unsigned long long timeout_ns = (unsigned long long)AB_STALL_TIMEOUT_MS * 1000000ULL;
+    const unsigned long long max_age_ns = (unsigned long long)max_age_ms * 1000000ULL;
 
-    // Lane 0 state: t = our tail (we are its only writer), h = last head seen.
-    unsigned long long t = 0, h = 0, consumed = 0, mismatches = 0, last_progress = 0;
+    // Lane 0 state: t = our tail (we are its only writer), h = last head seen,
+    // idle = consecutive empty polls.
+    unsigned long long t = 0, h = 0, consumed = 0, mismatches = 0;
+    unsigned long long entry_ns = 0, last_progress = 0;
+    unsigned int idle = 0;
     int stalled = 0;
     if (lane == 0) {
         // The previous episode's kernel finished before this launch, so its last
         // tail store is visible.
         t = tail.load(cuda::memory_order_relaxed);
         h = t;
-        last_progress = zc_globaltimer_ns();
+        entry_ns = zc_globaltimer_ns();
+        last_progress = entry_ns;
         running.store(episode_id, cuda::memory_order_release);
     }
 
@@ -74,15 +91,23 @@ __global__ void zc_consumer_kernel(ZcRing* ring, unsigned long long* ack_slots, 
             // memory_order_acquire: slot reads below see what the producer wrote.
             if (!held && t >= h) h = head.load(cuda::memory_order_acquire);
             if (!held && t < h) {
-                action = ZC_ACT_PROCESS;
-            } else {
+                idle = 0;
+                // Age cap while busy; last_progress is when the last chunk finished.
+                if (last_progress - entry_ns > max_age_ns) {
+                    stalled = 1;
+                    action = ZC_ACT_EXIT;
+                } else {
+                    action = ZC_ACT_PROCESS;
+                }
+            } else if (++idle % ZC_STOP_CHECK_POLLS == 0) {
                 // Compare stop_at with tail, not with a possibly stale head: the
                 // producer publishes head before stop_at, so t >= stop_at means
                 // every published chunk has been consumed.
-                unsigned long long s = stop_at.load(cuda::memory_order_acquire);
+                const unsigned long long s = stop_at.load(cuda::memory_order_acquire);
+                const unsigned long long now = zc_globaltimer_ns();
                 if (t >= s) {
                     action = ZC_ACT_EXIT;
-                } else if (zc_globaltimer_ns() - last_progress > timeout_ns) {
+                } else if (now - last_progress > timeout_ns || now - entry_ns > max_age_ns) {
                     stalled = 1;
                     action = ZC_ACT_EXIT;
                 }
@@ -153,6 +178,7 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
     const unsigned long long total = cfg.warmup + cfg.chunks;
     const unsigned int num_samples = samples_for_chunk_ms(cfg.chunk_ms);
     const int work_iters = work_iters_for(cfg.work);
+    const int max_age_ms = cfg.debug_kernel_max_age_ms > 0 ? cfg.debug_kernel_max_age_ms : ZC_MAX_KERNEL_AGE_MS;
 
     LatencyLog log;
     if (!latency_log_init(&log, total)) {
@@ -198,7 +224,7 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
         CUDA_CHECK(cudaMemset(d_res, 0, sizeof(ZcKernelResult)));
         if (!cfg.debug_skip_kernel) {
             zc_consumer_kernel<<<1, 32>>>(d_ring, d_acks, work_iters, episode_id,
-                                          cfg.debug_kernel_stop_at, d_res, d_sink);
+                                          cfg.debug_kernel_stop_at, max_age_ms, d_res, d_sink);
             CUDA_CHECK(cudaGetLastError());
             // Windows (WDDM) queues launches until something flushes them.
             cudaError_t q = cudaStreamQuery(0);

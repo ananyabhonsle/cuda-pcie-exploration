@@ -85,7 +85,7 @@ static void test_stall_is_reported() {
     double ms;
     RunResult r = timed_run("stall_is_reported", c, &ms);
     CHECK(r.stalled == 1);
-    CHECK(ms < 3000.0);
+    CHECK(ms < 2000.0);
 }
 
 static void test_no_producer_is_reported() {
@@ -95,7 +95,7 @@ static void test_no_producer_is_reported() {
     double ms;
     RunResult r = timed_run("no_producer_is_reported", c, &ms);
     CHECK(r.stalled == 1);
-    CHECK(ms < 3000.0);
+    CHECK(ms < 2000.0);
 }
 
 static void test_no_kernel_is_reported() {
@@ -105,7 +105,20 @@ static void test_no_kernel_is_reported() {
     double ms;
     RunResult r = timed_run("no_kernel_is_reported", c, &ms);
     CHECK(r.stalled == 1);
-    CHECK(ms < 3000.0);
+    CHECK(ms < 2000.0);
+}
+
+// A kernel older than its age cap exits as stalled, even while chunks keep
+// arriving. The hook lowers the cap from ZC_MAX_KERNEL_AGE_MS to 200 ms.
+static void test_age_cap_is_enforced() {
+    RunConfig c = default_config();
+    c.chunks = 1000;
+    c.debug_kernel_max_age_ms = 200;
+    double ms;
+    RunResult r = timed_run("age_cap_is_enforced", c, &ms);
+    CHECK(r.stalled == 1);
+    CHECK(r.samples < c.chunks);
+    CHECK(ms < 2000.0);
 }
 
 int main() {
@@ -116,6 +129,7 @@ int main() {
     test_stall_is_reported();
     test_no_producer_is_reported();
     test_no_kernel_is_reported();
+    test_age_cap_is_enforced();
     // A healthy run after the stall tests proves the GPU and runtime were left usable.
     test_basic_paced();
     return check_finish();
