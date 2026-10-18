@@ -1,6 +1,6 @@
 ![C++](https://img.shields.io/badge/C++-17-blue.svg)
 ![CUDA](https://img.shields.io/badge/CUDA-12.x-green.svg)
-![Status](https://img.shields.io/badge/Status-Phase_2-yellow.svg)
+![Status](https://img.shields.io/badge/Status-Phase_3-yellow.svg)
 
 **CUDA PCIe Exploration**
 *Learning low-level CUDA memory management by characterizing host-to-device transfer latency.*
@@ -10,7 +10,8 @@
 **Current Status**
 *   **Phase 1 (Complete):** Validated `cudaHostAllocWriteCombined` allocation and benchmarked CPU write/read throughput on write-combined vs. pinned vs. pageable memory.
 *   **Phase 2 (Complete):** Validated lock-free SPSC ring buffer with `alignas(64)` cache-line padding. Successfully transferred 1,000,000 integers with zero data corruption.
-*   **Next:** Phase 3 - Allocate ring buffer in pinned memory and verify GPU can read from it asynchronously.
+*   **Phase 3 (Complete):** Moved the ring buffer into mapped pinned memory with a GPU kernel as the consumer. The CPU producer and GPU consumer sync over PCIe with system-scope `cuda::atomic_ref` loads/stores; the GPU drains the buffer in batches. 1,000,000 integers transferred with zero data corruption (~155 ms on an RTX 3050 Ti Laptop).
+*   **Next:** Phase 4 - Measure one-way CPU→GPU latency (ping-pong) and compare transfer methods across message sizes.
 
 ---
 
@@ -30,4 +31,8 @@ nvcc -O2 -std=c++17 src/wc_memory_test.cu -o phase1
 # Phase 2: lock-free SPSC ring buffer (CPU only)
 g++ -O2 -std=c++17 -pthread src/phase2_ringbuffer.cpp -o phase2
 ./phase2
+
+# Phase 3: CPU producer -> GPU consumer over PCIe (needs an NVIDIA GPU)
+nvcc -O2 -std=c++17 -arch=native src/phase3_gpu_consumer.cu -o phase3
+./phase3
 ```
