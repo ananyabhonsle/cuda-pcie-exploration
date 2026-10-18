@@ -67,6 +67,31 @@ static void test_variant_names() {
     CHECK(strcmp(variant_name(c), "V3") == 0);
 }
 
+// Copies field `col` (0-based) of a CSV line into out; quoted fields keep
+// their commas. Returns false if the line has fewer fields.
+static bool csv_field(const char* line, int col, char* out, size_t n) {
+    int c = 0;
+    bool quoted = false;
+    size_t k = 0;
+    for (const char* p = line;; ++p) {
+        if (*p == '"') { quoted = !quoted; continue; }
+        if (*p == 0 || (*p == ',' && !quoted)) {
+            if (c == col) { out[k] = 0; return true; }
+            if (*p == 0) return false;
+            ++c;
+            continue;
+        }
+        if (c == col && k + 1 < n) out[k++] = *p;
+    }
+}
+
+static int csv_column(const char* header, const char* name) {
+    char f[64];
+    for (int c = 0; csv_field(header, c, f, sizeof(f)); ++c)
+        if (strcmp(f, name) == 0) return c;
+    return -1;
+}
+
 static void test_csv_header_and_rows() {
     const char* path = "build/test_config.csv";
     remove(path);
@@ -75,6 +100,7 @@ static void test_csv_header_and_rows() {
     RunResult r;
     memset(&r, 0, sizeof(r));
     r.lat.p50 = 12.345; r.chunks_per_s = 999.95;
+    r.lat.mean = 3.25; r.gpu_work_us = 7.5;
     CHECK(append_csv_row(path, c, p, r));
     CHECK(append_csv_row(path, c, p, r));
     FILE* f = fopen(path, "r");
@@ -96,6 +122,18 @@ static void test_csv_header_and_rows() {
         char q[160];
         snprintf(q, sizeof(q), ",\"%s\",", p.gpu);
         CHECK(strstr(lines[1], q) != nullptr);
+        // gpu_work_us sits right after mean_us, in header and row alike.
+        const int mean_col = csv_column(CSV_HEADER, "mean_us");
+        const int work_col = csv_column(CSV_HEADER, "gpu_work_us");
+        CHECK(mean_col >= 0);
+        CHECK(work_col == mean_col + 1);
+        char f[64];
+        CHECK(csv_field(lines[1], mean_col, f, sizeof(f)) && strcmp(f, "3.25") == 0);
+        CHECK(csv_field(lines[1], work_col, f, sizeof(f)) && strcmp(f, "7.50") == 0);
+        int header_cols = 0, row_cols = 0;
+        while (csv_field(lines[0], header_cols, f, sizeof(f))) ++header_cols;
+        while (csv_field(lines[1], row_cols, f, sizeof(f))) ++row_cols;
+        CHECK(header_cols == row_cols);
     }
     remove(path);
 }

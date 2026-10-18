@@ -39,6 +39,7 @@ int main(int argc, char** argv) {
                cfg.chunk_ms, chunk_bytes, work_str(cfg.work), cfg.chunks, cfg.warmup, r.episodes);
     printf("latency us: p50 %.2f  p99 %.2f  p99.9 %.2f  max %.2f  mean %.2f\n",
            r.lat.p50, r.lat.p99, r.lat.p999, r.lat.max, r.lat.mean);
+    printf("gpu work: %.2f us/chunk (mean, measured in the kernel)\n", r.gpu_work_us);
     printf("throughput: %.0f chunks/s, %.1f MB/s\n", r.chunks_per_s, r.mb_per_s);
 
     bool ok = (r.mismatches == 0 && !r.stalled);

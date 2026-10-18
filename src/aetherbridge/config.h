@@ -153,6 +153,7 @@ inline bool parse_args(int argc, char** argv, RunConfig* cfg, char* err, size_t 
 
 struct RunResult {
     LatencyStats lat;
+    double gpu_work_us;  // mean in-kernel time per measured chunk in process_chunk_warp
     double chunks_per_s;
     double mb_per_s;
     unsigned long long mismatches;
@@ -195,7 +196,7 @@ inline const char* variant_name(const RunConfig& c) {
     return c.transport == TRANSPORT_SYNC ? "V3" : "V4";
 }
 
-#define CSV_HEADER "variant,queue,wait,transport,queue_capacity,staging_slots,chunk_ms,chunk_bytes,work,pacing_us,platform,gpu,cuda,chunks,warmup,episodes,p50_us,p99_us,p999_us,max_us,mean_us,chunks_per_s,mb_per_s,mismatches,stalled"
+#define CSV_HEADER "variant,queue,wait,transport,queue_capacity,staging_slots,chunk_ms,chunk_bytes,work,pacing_us,platform,gpu,cuda,chunks,warmup,episodes,p50_us,p99_us,p999_us,max_us,mean_us,gpu_work_us,chunks_per_s,mb_per_s,mismatches,stalled"
 
 inline bool append_csv_row(const char* path, const RunConfig& c, const PlatformInfo& p, const RunResult& r) {
     bool need_header = true;
@@ -208,12 +209,12 @@ inline bool append_csv_row(const char* path, const RunConfig& c, const PlatformI
     FILE* f = fopen(path, "ab");
     if (!f) return false;
     if (need_header) fprintf(f, "%s\n", CSV_HEADER);
-    fprintf(f, "%s,%s,%s,%s,%d,%d,%d,%u,%s,%d,%s,\"%s\",%s,%llu,%llu,%llu,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f,%llu,%d\n",
+    fprintf(f, "%s,%s,%s,%s,%d,%d,%d,%u,%s,%d,%s,\"%s\",%s,%llu,%llu,%llu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f,%llu,%d\n",
             variant_name(c), queue_str(c.queue), wait_str(c.wait), transport_str(c.transport),
             AB_QUEUE_CAPACITY, AB_STAGING_SLOTS, c.chunk_ms, samples_for_chunk_ms(c.chunk_ms) * 4u,
             work_str(c.work), c.pace_us, p.platform, p.gpu, p.cuda,
             c.chunks, c.warmup, r.episodes,
-            r.lat.p50, r.lat.p99, r.lat.p999, r.lat.max, r.lat.mean,
+            r.lat.p50, r.lat.p99, r.lat.p999, r.lat.max, r.lat.mean, r.gpu_work_us,
             r.chunks_per_s, r.mb_per_s, r.mismatches, r.stalled);
     fclose(f);
     return true;

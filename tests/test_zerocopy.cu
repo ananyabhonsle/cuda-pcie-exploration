@@ -2,10 +2,12 @@
 #include "check.h"
 
 static void print_result(const char* name, const RunResult& r, double wall_ms) {
-    printf("%-26s p50 %.2f p99 %.2f p99.9 %.2f max %.2f mean %.2f us | %.0f chunks/s %.1f MB/s | "
-           "samples %llu episodes %llu mismatches %llu stalled %d | %.0f ms\n",
-           name, r.lat.p50, r.lat.p99, r.lat.p999, r.lat.max, r.lat.mean, r.chunks_per_s, r.mb_per_s,
-           r.samples, r.episodes, r.mismatches, r.stalled, wall_ms);
+    printf("%-28s p50 %.2f p99 %.2f p99.9 %.2f max %.2f mean %.2f gpu_work %.2f us | "
+           "%.0f chunks/s %.1f MB/s | samples %llu consumed %llu episodes %llu mismatches %llu "
+           "stalled %d | %.0f ms\n",
+           name, r.lat.p50, r.lat.p99, r.lat.p999, r.lat.max, r.lat.mean, r.gpu_work_us,
+           r.chunks_per_s, r.mb_per_s, r.samples, r.consumed, r.episodes, r.mismatches,
+           r.stalled, wall_ms);
 }
 
 // Runs one configuration and returns its wall time in ms through *wall_ms.
@@ -68,6 +70,29 @@ static void test_many_episodes_and_ack_wrap() {
     CHECK(r.consumed == c.warmup + c.chunks);
     CHECK(r.mismatches == 0);
     CHECK(r.stalled == 0);
+}
+
+// The in-kernel work time per chunk is reported and grows with the work level.
+static void test_gpu_work_is_measured() {
+    const WorkLevel levels[3] = {WORK_NONE, WORK_LIGHT, WORK_HEAVY};
+    double us[3] = {0, 0, 0};
+    for (int i = 0; i < 3; ++i) {
+        RunConfig c = default_config();
+        c.chunks = 300;
+        c.warmup = 50;
+        c.work = levels[i];
+        char name[32];
+        snprintf(name, sizeof(name), "gpu_work_%s", work_str(levels[i]));
+        double ms;
+        RunResult r = timed_run(name, c, &ms);
+        CHECK(r.stalled == 0);
+        CHECK(r.mismatches == 0);
+        us[i] = r.gpu_work_us;
+    }
+    CHECK(us[0] > 0.0);
+    CHECK(us[0] < us[1]);
+    CHECK(us[1] < us[2]);
+    CHECK(us[2] > 50.0);
 }
 
 static void test_corruption_is_detected() {
@@ -170,6 +195,7 @@ int main() {
     test_basic_paced();
     test_chunk_sizes();
     test_many_episodes_and_ack_wrap();
+    test_gpu_work_is_measured();
     test_corruption_is_detected();
     test_bad_header_seq_is_detected();
     test_zeroed_slot_is_detected();

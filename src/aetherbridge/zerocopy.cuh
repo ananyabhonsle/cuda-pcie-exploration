@@ -25,15 +25,21 @@ struct ZcRing {
 // mismatches counts wrong samples plus one per chunk whose header is wrong
 // (seq != its ring index, or num_samples != the run's chunk size); a header
 // error is an integrity error like a bad sample, so it shares the CSV column.
+// work_ns sums lane 0's globaltimer time inside process_chunk_warp over the
+// work_chunks chunks with seq >= measure_from (warm-up excluded).
 struct ZcKernelResult {
     unsigned long long consumed;
     unsigned long long mismatches;
+    unsigned long long work_ns;
+    unsigned long long work_chunks;
     int stalled;
 };
 
 __device__ inline unsigned long long zc_globaltimer_ns() {
     unsigned long long t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    // "memory": the compiler may not move loads or stores across the read, so
+    // the timestamps around process_chunk_warp bracket its slot reads.
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t) : : "memory");
     return t;
 }
 
@@ -58,10 +64,11 @@ __device__ inline unsigned long long zc_globaltimer_ns() {
 // identically. num_samples is the run's chunk size (<= AB_MAX_CHUNK_SAMPLES).
 // Test hook: debug_stop_at >= 0 stops consumption at that seq (the kernel
 // keeps looping, so the watchdogs fire). max_age_ms is ZC_MAX_KERNEL_AGE_MS
-// except in tests.
+// except in tests. Work time is summed for chunks with seq >= measure_from.
 __global__ void zc_consumer_kernel(ZcRing* ring, unsigned long long* ack_slots, unsigned int num_samples,
                                    int work_iters, unsigned long long episode_id, long long debug_stop_at,
-                                   int max_age_ms, ZcKernelResult* out, float* sink) {
+                                   int max_age_ms, unsigned long long measure_from, ZcKernelResult* out,
+                                   float* sink) {
     const unsigned int full = 0xFFFFFFFFu;
     const unsigned int lane = threadIdx.x & 31u;
     SysAtomicU64 head(ring->head);
@@ -73,7 +80,7 @@ __global__ void zc_consumer_kernel(ZcRing* ring, unsigned long long* ack_slots, 
 
     // Lane 0 state: t = our tail (we are its only writer), h = last head seen,
     // idle = consecutive empty polls.
-    unsigned long long t = 0, h = 0, consumed = 0, mismatches = 0;
+    unsigned long long t = 0, h = 0, consumed = 0, mismatches = 0, work_ns = 0, work_chunks = 0;
     unsigned long long entry_ns = 0, last_progress = 0;
     unsigned int idle = 0;
     int stalled = 0;
@@ -131,10 +138,20 @@ __global__ void zc_consumer_kernel(ZcRing* ring, unsigned long long* ack_slots, 
         // num_samples, never against the header.
         const unsigned long long hdr_seq = c->seq;
         const unsigned int hdr_n = c->num_samples;
+        // Read by every lane (only lane 0's value is used) so the warp does not
+        // diverge here and no lane starts its sample reads before the stamp.
+        const unsigned long long w0 = zc_globaltimer_ns();
         // Ends with a full-mask shuffle, so every lane's slot reads are done.
         const unsigned int bad = process_chunk_warp(c, idx, num_samples, work_iters, sink);
         __syncwarp(full);
         if (lane == 0) {
+            // In-situ work time: the shuffle above waited for every lane, so
+            // w1 - w0 covers the whole warp's sample reads and compute.
+            const unsigned long long w1 = zc_globaltimer_ns();
+            if (idx >= measure_from) {
+                work_ns += w1 - w0;
+                ++work_chunks;
+            }
             mismatches += bad;
             if (hdr_seq != idx || hdr_n != num_samples) ++mismatches;
             // Ack the ring index: acks stay in order and exactly once even
@@ -152,6 +169,8 @@ __global__ void zc_consumer_kernel(ZcRing* ring, unsigned long long* ack_slots, 
     if (lane == 0) {
         out->consumed = consumed;
         out->mismatches = mismatches;
+        out->work_ns = work_ns;
+        out->work_chunks = work_chunks;
         out->stalled = stalled;
     }
 }
@@ -226,6 +245,7 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
     unsigned long long head = 0;  // producer's copy; it is the only writer
     unsigned long long episodes = 0, mismatches = 0;  // episodes = kernels launched
     unsigned long long consumed = 0;                   // summed over episodes
+    unsigned long long work_ns = 0, work_chunks = 0;   // summed over episodes
     unsigned long long episode_id = 0;                 // running_episode starts at 0
     double active_us = 0.0;
     int stalled = 0;
@@ -237,7 +257,7 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
         CUDA_CHECK(cudaMemset(d_res, 0, sizeof(ZcKernelResult)));
         if (!cfg.debug_skip_kernel) {
             zc_consumer_kernel<<<1, 32>>>(d_ring, d_acks, num_samples, work_iters, episode_id,
-                                          cfg.debug_kernel_stop_at, max_age_ms, d_res, d_sink);
+                                          cfg.debug_kernel_stop_at, max_age_ms, cfg.warmup, d_res, d_sink);
             CUDA_CHECK(cudaGetLastError());
             // Windows (WDDM) queues launches until something flushes them.
             cudaError_t q = cudaStreamQuery(0);
@@ -302,6 +322,8 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
         CUDA_CHECK(cudaMemcpy(&kr, d_res, sizeof(kr), cudaMemcpyDeviceToHost));
         mismatches += kr.mismatches;
         consumed += kr.consumed;
+        work_ns += kr.work_ns;
+        work_chunks += kr.work_chunks;
         if (kr.stalled || producer_stopped) stalled = 1;
         if (stalled) log.abort.store(1, std::memory_order_release);
     }
@@ -334,6 +356,7 @@ inline RunResult run_zerocopy(const RunConfig& cfg) {
     r.samples = samples;
     r.mismatches = mismatches;
     r.consumed = consumed;
+    if (work_chunks > 0) r.gpu_work_us = (double)work_ns / (double)work_chunks / 1000.0;
     r.episodes = episodes;
     r.stalled = stalled;
     // head == total on a complete run; on an aborted run it counts what was sent.

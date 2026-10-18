@@ -3,12 +3,15 @@
 #include "aetherbridge/common.h"
 #include "aetherbridge/config.h"
 
-// Stand-in GPU work per chunk (replaces the real audio model).
-// Measured with tests/calibrate_work.cu, 20 ms chunks (320 samples), one warp,
-// chunks back to back in device memory. Work scales linearly with chunk length.
-//   GPU: NVIDIA GeForce RTX 3050 Ti Laptop GPU (sm_86), run-to-run noise ~5-10%
-//   AB_WORK_ITERS_LIGHT -> ~10 us/chunk (measured 9.4-11.1)
-//   AB_WORK_ITERS_HEAVY -> ~200 us/chunk (measured 193-206)
+// Stand-in GPU work per chunk (replaces the real audio model). The same
+// iteration counts are used on every platform.
+// Calibrated with tests/calibrate_work.cu (20 ms chunks = 320 samples, one
+// warp, chunks back to back in device memory) on the RTX 3050 Ti Laptop
+// (sm_86), in one session: light ~10 us/chunk (9.4-11.1), heavy ~200 us/chunk
+// (193-206). A later session on the same GPU gave light 7.6-9.8 us and heavy
+// 145-147 us: time per iteration varies with GPU clock and power state, so
+// these counts do not pin GPU time. The CSV's gpu_work_us, measured in the
+// kernel on every run, is the authoritative per-run figure.
 #define AB_WORK_ITERS_LIGHT 170
 #define AB_WORK_ITERS_HEAVY 6500
 
