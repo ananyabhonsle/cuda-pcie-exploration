@@ -180,7 +180,7 @@ inline PlatformInfo get_platform_info() {
     int dev = 0;
     cudaDeviceProp prop;
     if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
-        snprintf(p.gpu, sizeof(p.gpu), "%s", prop.name);
+        snprintf(p.gpu, sizeof(p.gpu), "%.127s", prop.name); // prop.name holds up to 256 bytes; p.gpu is 128
     else
         snprintf(p.gpu, sizeof(p.gpu), "unknown");
     int ver = 0;
